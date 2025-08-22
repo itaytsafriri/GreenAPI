@@ -1,0 +1,47 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WhatsApp QR Code</title>
+    <style>
+        body { 
+            font-family: Arial, sans-serif; 
+            text-align: center; 
+            padding: 20px; 
+            background-color: #f0f0f0;
+        }
+        .qr-container {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            display: inline-block;
+        }
+        img { 
+            max-width: 400px; 
+            height: auto; 
+            border: 2px solid #25D366;
+            border-radius: 10px;
+        }
+        h1 { color: #25D366; }
+        .instructions {
+            margin-top: 20px;
+            color: #666;
+            font-size: 16px;
+        }
+    </style>
+</head>
+<body>
+    <h1>🔗 WhatsApp QR Code</h1>
+    <div class="qr-container">
+        <img src="data:image/png;base64,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" alt="WhatsApp QR Code">
+        <div class="instructions">
+            <p><strong>Scan this QR code with your phone's WhatsApp:</strong></p>
+            <p>1. Open WhatsApp on your phone</p>
+            <p>2. Go to Settings → Linked Devices</p>
+            <p>3. Tap "Link a Device"</p>
+            <p>4. Scan this QR code</p>
+        </div>
+    </div>
+</body>
+</html>
