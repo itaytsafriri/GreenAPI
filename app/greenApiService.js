@@ -35,6 +35,7 @@ let qrAttempts = 0;
 let qrPollingInterval = null;
 let notificationPollingInterval = null;
 let isFetchingGroups = false;
+let isLoggingOut = false; // Flag to prevent multiple logout attempts
 
 // Error handling
 process.on('uncaughtException', (err) => {
@@ -105,7 +106,11 @@ class GreenApiClient {
     }
 
     async getGroups() {
-        return this.request(`/waInstance${this.idInstance}/getChats/${this.apiTokenInstance}`);
+        // Use POST method like the working version
+        return this.request(`/waInstance${this.idInstance}/getChats/${this.apiTokenInstance}`, {
+            method: 'POST',
+            body: {}
+        });
     }
 
     async getChatHistory(chatId, count = 100) {
@@ -311,7 +316,7 @@ async function checkConnectionStatus() {
                 isConnected = true;
                 log('Client is ready!');
                 sendToHost({ type: 'status', connected: true });
-                sendToHost({ type: 'userName', name: 'Green API User' });
+                sendToHost({ type: 'userName', name: 'GreenAPI User' });
             }
         } else if (state.stateInstance === 'notAuthorized') {
             if (isConnected) {
@@ -357,6 +362,12 @@ async function fetchAndSendGroups() {
             try {
                 log(`Attempt ${retryCount + 1} of ${maxRetries} to fetch groups`);
                 
+                // Add extra delay on first attempt to ensure API is ready
+                if (retryCount === 0) {
+                    log('First attempt - adding extra 5 second delay to ensure API readiness...');
+                    await new Promise(resolve => setTimeout(resolve, 5000));
+                }
+                
                 // Add a timeout to prevent hanging
                 const timeoutPromise = new Promise((_, reject) => {
                     setTimeout(() => reject(new Error('Group fetch timeout after 30 seconds')), 30000);
@@ -366,14 +377,25 @@ async function fetchAndSendGroups() {
                 const response = await Promise.race([fetchPromise, timeoutPromise]);
                 
                 if (response && Array.isArray(response)) {
+                    log(`Raw response has ${response.length} total chats on attempt ${retryCount + 1}`);
+                    
                     // Filter for groups (chats with @g.us in ID) - like React version
-                    groups = response
+                    const currentGroups = response
                         .filter(chat => chat.id && chat.id.includes('@g.us'))
                         .map(group => ({
                             id: group.id,
                             name: group.name || group.subject || 'Unknown Group'
                         }));
-                    log(`Found ${groups.length} groups out of ${response.length} total chats`);
+                    
+                    log(`Found ${currentGroups.length} groups out of ${response.length} total chats on attempt ${retryCount + 1}`);
+                    
+                    // If this is the first attempt or we got more groups, use this result
+                    if (groups.length === 0 || currentGroups.length > groups.length) {
+                        groups = currentGroups;
+                        log(`Using result from attempt ${retryCount + 1} (${groups.length} groups)`);
+                    } else {
+                        log(`Keeping previous result (${groups.length} groups) as it had more groups`);
+                    }
                     
                     // Debug: Show first few groups
                     if (groups.length > 0) {
@@ -382,7 +404,15 @@ async function fetchAndSendGroups() {
                             log(`  ${index + 1}. ${group.name} (${group.id})`);
                         });
                     }
-                    break; // Success, exit retry loop
+                    // Don't break immediately - try all attempts to get the most complete list
+                    if (retryCount + 1 >= maxRetries) {
+                        break; // Only break on last attempt
+                    } else {
+                        log(`Continuing to next attempt to potentially get more groups...`);
+                        retryCount++;
+                        await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2 seconds between attempts
+                        continue;
+                    }
                 } else {
                     log('No chats found in response');
                     break; // No chats but no error, exit retry loop
@@ -433,16 +463,18 @@ async function startNotificationPolling() {
             const notifications = await client.receiveNotification();
             
             if (notifications && notifications.body) {
-                log(`📨 Notification received - type: ${notifications.body.typeWebhook}, chatId: ${notifications.body.senderData?.chatId}`);
-                
-                // Debug: Log if this is a message from monitored group
-                if (notifications.body.typeWebhook === 'incomingMessageReceived' && 
-                    notifications.body.senderData?.chatId === selectedGroupId) {
-                    log(`🎯 MESSAGE FROM MONITORED GROUP! Group: ${selectedGroupId}`);
-                    log(`📝 Message type: ${notifications.body.messageData?.typeMessage}`);
-                    if (notifications.body.messageData?.typeMessage === 'textMessage') {
-                        log(`💬 Text: ${notifications.body.messageData.textMessageData?.textMessage}`);
+                // Debug: Log all message types when monitoring to see what we're missing
+                if (isMonitoring && selectedGroupId) {
+                    const webhook = notifications.body.typeWebhook;
+                    const chatId = notifications.body.senderData?.chatId;
+                    
+                                    if (webhook === 'incomingMessageReceived' || webhook === 'outgoingMessageReceived') {
+                    if (chatId === selectedGroupId) {
+                        // Don't log here - let processNotification handle the specific logging
+                    } else {
+                        // Don't log messages from other groups - too verbose
                     }
+                }
                 }
                 
                 // Process the notification
@@ -452,13 +484,11 @@ async function startNotificationPolling() {
                 if (notifications.receiptId) {
                     try {
                         await client.deleteNotification(notifications.receiptId);
-                        log(`Deleted notification: ${notifications.receiptId}`);
                     } catch (deleteError) {
-                        log(`Failed to delete notification: ${deleteError.message}`);
+                        // Silent deletion - don't log every delete
                     }
                 }
             }
-            // Remove "No notifications received" log to reduce spam
         } catch (error) {
             if (error.message.includes('429')) {
                 log('Rate limit hit, slowing down polling...');
@@ -493,24 +523,14 @@ async function processNotification(notification) {
         
         const { typeWebhook, senderData, messageData } = notification.body;
         
-        // Handle state changes (like React example)
+        // Handle state changes - ignore rapid fluctuations like whatsapp.js
         if (typeWebhook === 'stateInstanceChanged') {
-            const newState = notification.body.stateInstance || notification.body?.stateAfter || notification.body?.statusInstance;
-            if (newState) {
-                log(`State changed to: ${newState}`);
-                if (newState === 'authorized' && !isConnected) {
-                    isConnected = true;
-                    sendToHost({ type: 'status', connected: true });
-                } else if (newState === 'notAuthorized' && isConnected) {
-                    isConnected = false;
-                    sendToHost({ type: 'status', connected: false });
-                }
-            }
+            // Ignore state changes after initial connection - GreenAPI fluctuates too much
             return;
         }
         
-        // Only process message notifications
-        if (typeWebhook !== 'incomingMessageReceived') {
+        // Process both incoming and outgoing message notifications (like whatsapp.js)
+        if (typeWebhook !== 'incomingMessageReceived' && typeWebhook !== 'outgoingMessageReceived') {
             return;
         }
         
@@ -520,102 +540,98 @@ async function processNotification(notification) {
         }
         
         if (senderData && senderData.chatId === selectedGroupId) {
-            log(`Message received from monitored group: ${selectedGroupId}`);
             
-            if (messageData && messageData.typeMessage === 'textMessage') {
-                // Handle text message
+            // Handle text messages
+            if (messageData && messageData.typeMessage === 'textMessage' && messageData.textMessageData) {
+                log('Text message received from monitored group');
                 const textData = messageData.textMessageData;
-                if (textData && textData.textMessage) {
-                    log(`Text message: ${textData.textMessage.substring(0, 100)}...`);
+                log(`Sending text message to host - Text: ${textData.textMessage.substring(0, 100)}...`);
+                sendToHost({
+                    type: 'text',
+                    Text: {
+                        Id: notification.body.idMessage || 'unknown',
+                        From: senderData.chatId,
+                        Author: senderData.sender || senderData.chatId,
+                        Type: 'text',
+                        Timestamp: notification.body.timestamp || Math.floor(Date.now() / 1000),
+                        Text: textData.textMessage,
+                        SenderName: senderData.senderName || 'Unknown'
+                    }
+                });
+            }
+            // Handle extended text messages (like forwarded messages)
+            else if (messageData && messageData.typeMessage === 'extendedTextMessage' && messageData.extendedTextMessageData) {
+                log('Text message received from monitored group');
+                const textData = messageData.extendedTextMessageData;
+                log(`Sending text message to host - Text: ${textData.text.substring(0, 100)}...`);
+                sendToHost({
+                    type: 'text',
+                    Text: {
+                        Id: notification.body.idMessage || 'unknown',
+                        From: senderData.chatId,
+                        Author: senderData.sender || senderData.chatId,
+                        Type: 'text',
+                        Timestamp: notification.body.timestamp || Math.floor(Date.now() / 1000),
+                        Text: textData.text,
+                        SenderName: senderData.senderName || 'Unknown'
+                    }
+                });
+            }
+            // Handle ALL media messages using fileMessageData (GreenAPI format)
+            else if (messageData && messageData.fileMessageData) {
+                log('Media message received from monitored group');
+                try {
+                    const fileData = messageData.fileMessageData;
+                    
+                    // Download the file using the downloadUrl
+                    const response = await fetch(fileData.downloadUrl);
+                    const arrayBuffer = await response.arrayBuffer();
+                    const base64Data = Buffer.from(arrayBuffer).toString('base64');
+                    
+                    // Create filename with timestamp and sender name (same format as whatsapp.js)
+                    const timestamp = new Date(notification.body.timestamp * 1000).toISOString()
+                        .replace(/[-:]/g, '')
+                        .split('.')[0]
+                        .replace('T', '_');
+                    const senderNameFormatted = (senderData.senderName || 'unknown')
+                        .replace(/[<>:"/\\|?*]/g, '_')
+                        .replace(/\s+/g, '_')
+                        .replace(/_{2,}/g, '_')
+                        .replace(/^_|_$/g, '');
+                    
+                    // Determine file extension from mimeType
+                    let extension = 'bin';
+                    if (fileData.mimeType) {
+                        if (fileData.mimeType.includes('image')) extension = 'jpg';
+                        else if (fileData.mimeType.includes('video')) extension = 'mp4';
+                        else if (fileData.mimeType.includes('audio')) extension = 'ogg';
+                        else if (fileData.mimeType.includes('pdf')) extension = 'pdf';
+                    }
+                    
+                    const filename = `${senderNameFormatted}_${timestamp}.${extension}`;
+                    
+                    log(`Sending media to host - Size: ${base64Data.length}`);
                     sendToHost({
-                        type: 'text',
-                        Text: {
-                            Id: messageData.idMessage || 'unknown',
+                        type: 'media',
+                        Media: {
+                            Id: notification.body.idMessage || 'unknown',
                             From: senderData.chatId,
                             Author: senderData.sender || senderData.chatId,
-                            Type: 'text',
-                            Timestamp: Math.floor(Date.now() / 1000),
-                            Text: textData.textMessage,
-                            SenderName: senderData.senderName || 'Unknown'
+                            Type: fileData.mimeType || 'application/octet-stream',
+                            Timestamp: notification.body.timestamp || Math.floor(Date.now() / 1000),
+                            Filename: filename,
+                            Data: base64Data,
+                            Size: base64Data.length,
+                            SenderName: senderData.senderName || 'Unknown',
+                            Body: fileData.caption || ''
                         }
                     });
-                }
-            } else if (messageData && messageData.typeMessage === 'imageMessage') {
-                // Handle image message
-                log('Image message received, downloading...');
-                try {
-                    const mediaData = messageData.imageMessage;
-                    const downloadResult = await client.downloadFile(mediaData.downloadUrl);
-                    
-                    if (downloadResult && downloadResult.data) {
-                        // Convert to base64
-                        const base64Data = Buffer.from(downloadResult.data).toString('base64');
-                        
-                        const timestamp = new Date().toISOString()
-                            .replace(/[-:]/g, '')
-                            .split('.')[0]
-                            .replace('T', '_');
-                        
-                        log(`Sending image to host - Size: ${downloadResult.data.length} bytes`);
-                        sendToHost({
-                            type: 'media',
-                            Media: {
-                                Id: messageData.idMessage || 'unknown',
-                                From: senderData.chatId,
-                                Author: senderData.sender || senderData.chatId,
-                                Type: 'image/jpeg',
-                                Timestamp: Math.floor(Date.now() / 1000),
-                                Filename: `${senderData.senderName || 'unknown'}_${timestamp}.jpg`,
-                                Data: base64Data,
-                                Size: downloadResult.data.length,
-                                SenderName: senderData.senderName || 'Unknown',
-                                Body: mediaData.caption || ''
-                            }
-                        });
-                    }
-                } catch (mediaError) {
-                    log(`Error downloading image: ${mediaError.message}`);
-                }
-            } else if (messageData && messageData.typeMessage === 'videoMessage') {
-                // Handle video message
-                log('Video message received, downloading...');
-                try {
-                    const mediaData = messageData.videoMessage;
-                    const downloadResult = await client.downloadFile(mediaData.downloadUrl);
-                    
-                    if (downloadResult && downloadResult.data) {
-                        const base64Data = Buffer.from(downloadResult.data).toString('base64');
-                        
-                        const timestamp = new Date().toISOString()
-                            .replace(/[-:]/g, '')
-                            .split('.')[0]
-                            .replace('T', '_');
-                        
-                        log(`Sending video to host - Size: ${downloadResult.data.length} bytes`);
-                        sendToHost({
-                            type: 'media',
-                            Media: {
-                                Id: messageData.idMessage || 'unknown',
-                                From: senderData.chatId,
-                                Author: senderData.sender || senderData.chatId,
-                                Type: 'video/mp4',
-                                Timestamp: Math.floor(Date.now() / 1000),
-                                Filename: `${senderData.senderName || 'unknown'}_${timestamp}.mp4`,
-                                Data: base64Data,
-                                Size: downloadResult.data.length,
-                                SenderName: senderData.senderName || 'Unknown',
-                                Body: mediaData.caption || ''
-                            }
-                        });
-                    }
-                } catch (mediaError) {
-                    log(`Error downloading video: ${mediaError.message}`);
+                } catch (error) {
+                    log(`Error downloading GreenAPI file: ${error.message}`);
                 }
             } else {
                 log(`Unhandled message type: ${messageData?.typeMessage}`);
             }
-        } else {
-            log(`Message not from monitored group - senderData.chatId: ${senderData?.chatId}, selectedGroupId: ${selectedGroupId}`);
         }
     } catch (error) {
         log(`Error processing notification: ${error.message}`);
@@ -634,6 +650,7 @@ async function initialize() {
             log('Already authorized, starting notification polling');
             isConnected = true;
             sendToHost({ type: 'status', connected: true });
+            sendToHost({ type: 'userName', name: 'GreenAPI User' });
             await startNotificationPolling();
         } else if (state === 'notAuthorized' || state === 'starting') {
             log(`State: ${state}, starting QR code polling`);
@@ -694,12 +711,20 @@ async function startQRCodePolling() {
                 }
                 isConnected = true;
                 sendToHost({ type: 'status', connected: true });
+                sendToHost({ type: 'userName', name: 'GreenAPI User' });
+                
+                // Start notification polling after authorization
+                log('Starting notification polling after QR authorization...');
+                await startNotificationPolling();
                 return;
             }
             
             if (state.stateInstance === 'notAuthorized' || state.stateInstance === 'starting') {
                 qrAttempts++;
-                log(`QR attempt ${qrAttempts}/unlimited`);
+                // Only log QR attempts occasionally to reduce spam
+                if (qrAttempts % 5 === 1) {
+                    log(`QR attempt ${qrAttempts}`);
+                }
                 
                 try {
                     const qrResponse = await client.getQr();
@@ -707,7 +732,7 @@ async function startQRCodePolling() {
                     
                     if (qrResponse && qrResponse.qr) {
                         if (now - lastQrTimestamp > 5000) {
-                            log('QR code received in qr field');
+                            log('QR code received');
                             await showQRInTerminal(qrResponse.qr);
                             // Don't send QR to host - just display in terminal like original
                             lastQrTimestamp = now;
@@ -715,7 +740,7 @@ async function startQRCodePolling() {
                         }
                     } else if (qrResponse && qrResponse.type === 'qrCode' && qrResponse.message) {
                         if (now - lastQrTimestamp > 5000) {
-                            log('QR code received in message field (base64)');
+                            log('QR code received');
                             // The message field contains base64 encoded QR code
                             await showQRInTerminal(qrResponse.message);
                             // Don't send QR to host - just display in terminal like original
@@ -756,6 +781,13 @@ async function startQRCodePolling() {
 }
 
 async function handleLogout() {
+    // Prevent multiple logout attempts
+    if (isLoggingOut) {
+        log('Logout already in progress, ignoring duplicate request');
+        return;
+    }
+    
+    isLoggingOut = true;
     log('Processing logout command');
     
     try {
@@ -775,9 +807,15 @@ async function handleLogout() {
             qrPollingInterval = null;
         }
         
+        // Send disconnection status like whatsapp.js
+        sendToHost({ type: 'status', connected: false });
+        sendToHost({ type: 'monitoringStatus', monitoring: false });
+        
         // Logout from Green API (this will unlink the phone)
         try {
             log('Logging out from Green API...');
+            // Small delay to avoid rate limiting
+            await new Promise(resolve => setTimeout(resolve, 500));
             const logoutResult = await client.logout();
             log(`Green API logout successful: ${JSON.stringify(logoutResult)}`);
             
